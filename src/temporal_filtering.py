@@ -1,15 +1,15 @@
 """
-Filtrado temporal usando lifting scheme con compensación de movimiento.
+Temporal filtering using lifting scheme with motion compensation.
 
-Este módulo implementa el filtrado temporal wavelet para MCTF usando
-el esquema de lifting con pasos Predict y Update.
+This module implements temporal wavelet filtering for MCTF using
+the lifting scheme with Predict and Update steps.
 
-Referencias:
+References:
     - Pesquet-Popescu, B., Bottreau, V. (2001). "Three-dimensional lifting 
       schemes for motion compensated video compression"
     - Secker, A., Taubman, D. (2003). "Lifting-based invertible motion 
       adaptive transform (LIMAT) framework"
-    - González-Ruiz, V. "MCTF"
+    - Gonzalez-Ruiz, V. "MCTF"
       https://github.com/vicente-gonzalez-ruiz/motion_compensated_temporal_filtering
 """
 
@@ -20,7 +20,7 @@ import logging
 from motion_compensation import motion_compensate
 
 
-# Coeficientes de wavelets para lifting scheme
+# Wavelet coefficients for lifting scheme
 WAVELET_COEFFICIENTS = {
     'haar': {
         'predict': 1.0,
@@ -39,23 +39,23 @@ WAVELET_COEFFICIENTS = {
 
 def get_wavelet_coefficients(wavelet_type: str) -> Tuple[float, float]:
     """
-    Obtiene los coeficientes de predicción y actualización para un wavelet.
-    
+    Get predict and update coefficients for a wavelet.
+
     Args:
-        wavelet_type: Tipo de wavelet ('haar', '5/3', '9/7')
-        
+        wavelet_type: Wavelet type ('haar', '5/3', '9/7')
+
     Returns:
-        (predict_coef, update_coef): Coeficientes del lifting scheme
-        
+        (predict_coef, update_coef): Lifting scheme coefficients
+
     Raises:
-        ValueError: Si el tipo de wavelet no está soportado
+        ValueError: If wavelet type is not supported
     """
     if wavelet_type not in WAVELET_COEFFICIENTS:
         raise ValueError(
             f"Wavelet type '{wavelet_type}' not supported. "
             f"Supported types: {list(WAVELET_COEFFICIENTS.keys())}"
         )
-    
+
     coeffs = WAVELET_COEFFICIENTS[wavelet_type]
     return coeffs['predict'], coeffs['update']
 
@@ -65,50 +65,54 @@ def temporal_filter_lifting(
     motion_vectors_forward: List[np.ndarray],
     motion_vectors_backward: List[np.ndarray],
     wavelet_type: str = '5/3',
-    block_size: int = 16
-) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    block_size: int = 16,
+    return_predictions: bool = False
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
     """
-    Aplica filtrado temporal usando lifting scheme con compensación de movimiento.
-    
-    Implementa el esquema IBB... donde los frames pares son low-pass (L)
-    y los impares generan high-pass (H) como residuos de predicción.
-    
+    Apply temporal filtering using lifting scheme with motion compensation.
+
+    Implements IBB... scheme where even frames are low-pass (L)
+    and odd frames generate high-pass (H) as prediction residuals.
+
     Args:
-        frames: Lista de frames a filtrar
-        motion_vectors_forward: Lista de MVs hacia adelante
-        motion_vectors_backward: Lista de MVs hacia atrás
-        wavelet_type: Tipo de wavelet ('haar', '5/3', '9/7')
-        block_size: Tamaño de bloque para MC
-        
+        frames: List of frames to filter
+        motion_vectors_forward: List of forward MVs
+        motion_vectors_backward: List of backward MVs
+        wavelet_type: Wavelet type ('haar', '5/3', '9/7')
+        block_size: Block size for MC
+        return_predictions: If True, also return prediction images
+
     Returns:
-        low_pass: Frames de baja frecuencia temporal (L)
-        high_pass: Frames de alta frecuencia temporal (H/residuos)
+        low_pass: Low temporal frequency frames (L)
+        high_pass: High temporal frequency frames (H/residuals)
+        predictions: Prediction images (only if return_predictions=True)
     """
-    
+
     n_frames = len(frames)
     predict_coef, update_coef = get_wavelet_coefficients(wavelet_type)
-    
+
     logging.info(f"Temporal filtering {n_frames} frames with {wavelet_type} wavelet")
-    
+
     low_pass = []
     high_pass = []
-    
-    # Procesar pares de frames (even, odd)
+    predictions = []
+
+    # Process frame pairs (even, odd)
     for i in range(0, n_frames - 1, 2):
-        frame_even = frames[i].astype(np.float32)      # Frame par (t=0,2,4...)
-        frame_odd = frames[i + 1].astype(np.float32)   # Frame impar (t=1,3,5...)
-        
+        frame_even = frames[i].astype(np.float32)      # Even frame (t=0,2,4...)
+        frame_odd = frames[i + 1].astype(np.float32)   # Odd frame (t=1,3,5...)
+
         # === PREDICT STEP ===
-        # Predecir frame odd usando MC desde frames even vecinos
-        
-        # MC desde frame anterior (even actual)
+        # Predict odd frame using MC from neighboring even frames
+
+        # MC from previous frame (current even)
         mc_prev = motion_compensate(
             frame_even,
             motion_vectors_backward[i] if i < len(motion_vectors_backward) else np.zeros_like(motion_vectors_backward[0]),
             block_size
         )
-        
-        # MC desde frame siguiente (even i+2) si existe
+
+        # MC from next frame (even i+2) if exists
         if i + 2 < n_frames:
             mc_next = motion_compensate(
                 frames[i + 2].astype(np.float32),
@@ -117,32 +121,38 @@ def temporal_filter_lifting(
             )
         else:
             mc_next = mc_prev
-        
-        # Predicción bidireccional
+
+        # Bidirectional prediction
         prediction = (mc_prev + mc_next) * predict_coef / 2.0
-        
-        # Residuo de alta frecuencia (H)
+
+        # Store prediction if requested
+        if return_predictions:
+            predictions.append(prediction)
+
+        # High frequency residual (H)
         h_frame = frame_odd - prediction
         high_pass.append(h_frame)
-        
+
         # === UPDATE STEP ===
-        # Actualizar frame even con información del residuo
+        # Update even frame with residual information
         mc_residual = motion_compensate(
             h_frame,
             motion_vectors_forward[i] if i < len(motion_vectors_forward) else np.zeros_like(motion_vectors_forward[0]),
             block_size
         )
-        
-        # Actualización (L)
+
+        # Update (L)
         l_frame = frame_even + mc_residual * update_coef
         low_pass.append(l_frame)
-    
-    # Si hay número impar de frames, el último pasa como low-pass
+
+    # If odd number of frames, last one passes as low-pass
     if n_frames % 2 != 0:
         low_pass.append(frames[-1].astype(np.float32))
-    
+
     logging.info(f"Temporal filtering complete: {len(low_pass)} L frames, {len(high_pass)} H frames")
 
+    if return_predictions:
+        return low_pass, high_pass, predictions
     return low_pass, high_pass
 
 
@@ -155,21 +165,21 @@ def inverse_temporal_filter_lifting(
     block_size: int = 16
 ) -> List[np.ndarray]:
     """
-    Reconstruye frames desde la descomposición temporal.
+    Reconstruct frames from temporal decomposition.
 
-    Aplica el lifting scheme inverso para recuperar los frames originales
-    desde los componentes L (low-pass) y H (high-pass).
+    Applies inverse lifting scheme to recover original frames
+    from L (low-pass) and H (high-pass) components.
 
     Args:
-        low_pass: Frames L (baja frecuencia temporal)
-        high_pass: Frames H (alta frecuencia temporal)
-        motion_vectors_forward: MVs hacia adelante
-        motion_vectors_backward: MVs hacia atrás
-        wavelet_type: Tipo de wavelet usado en la codificación
-        block_size: Tamaño de bloque para MC
+        low_pass: L frames (low temporal frequency)
+        high_pass: H frames (high temporal frequency)
+        motion_vectors_forward: Forward MVs
+        motion_vectors_backward: Backward MVs
+        wavelet_type: Wavelet type used in encoding
+        block_size: Block size for MC
 
     Returns:
-        reconstructed_frames: Lista de frames reconstruidos
+        reconstructed_frames: List of reconstructed frames
     """
 
     predict_coef, update_coef = get_wavelet_coefficients(wavelet_type)
@@ -186,7 +196,7 @@ def inverse_temporal_filter_lifting(
         h_frame = high_pass[i].astype(np.float32)
 
         # === INVERSE UPDATE ===
-        # Recuperar frame even original
+        # Recover original even frame
         mc_residual = motion_compensate(
             h_frame,
             motion_vectors_forward[2 * i] if 2 * i < len(motion_vectors_forward) else np.zeros_like(motion_vectors_forward[0]),
@@ -197,9 +207,9 @@ def inverse_temporal_filter_lifting(
         reconstructed_frames.append(frame_even)
 
         # === INVERSE PREDICT ===
-        # Recuperar frame odd original
+        # Recover original odd frame
 
-        # MC para predicción
+        # MC for prediction
         mc_prev = motion_compensate(
             frame_even,
             motion_vectors_backward[2 * i] if 2 * i < len(motion_vectors_backward) else np.zeros_like(motion_vectors_backward[0]),
@@ -215,18 +225,17 @@ def inverse_temporal_filter_lifting(
         else:
             mc_next = mc_prev
 
-        # Predicción bidireccional
+        # Bidirectional prediction
         prediction = (mc_prev + mc_next) * predict_coef / 2.0
 
         # Inverse predict
         frame_odd = h_frame + prediction
         reconstructed_frames.append(frame_odd)
 
-    # Si hubo frame extra en low_pass (número impar de frames)
+    # If there was an extra frame in low_pass (odd number of frames)
     if n_low > n_high:
         reconstructed_frames.append(low_pass[-1].astype(np.float32))
 
     logging.info(f"Inverse temporal filtering complete: {len(reconstructed_frames)} frames")
 
     return reconstructed_frames
-

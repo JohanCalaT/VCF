@@ -1,52 +1,47 @@
 """
 MCTF: Motion Compensated Temporal Filtering codec.
 
-Este módulo implementa un codec de video basado en filtrado temporal
-con compensación de movimiento usando lifting scheme.
+This module implements a video codec based on temporal filtering
+with motion compensation using lifting scheme.
 
-Estructura GOP: IBB... (I-frame seguido de B-frames, SIN P-frames)
-- Frame I: codificado independientemente (intra)
-- Frames B: predichos bidireccionalmente
-
-Referencias:
-    - Ohm, J.R. (1994). "Three-dimensional subband coding with motion compensation"
-    - Pesquet-Popescu, B., Bottreau, V. (2001). "Three-dimensional lifting schemes"
-    - González-Ruiz, V. "MCTF" https://github.com/vicente-gonzalez-ruiz/motion_compensated_temporal_filtering
+Key features:
+- Bidirectional motion estimation (Diamond Search algorithm)
+- Temporal filtering with Haar, 5/3, or 9/7 wavelets
+- Block DCT with zigzag scan for spatial compression
+- GOP-based processing
 """
 
-import sys
-import os
 import logging
+import os
 import numpy as np
 import cv2
-import av
 from PIL import Image
-import importlib
 import pickle
-import tempfile
+import zlib
 
+# Import VCF framework modules
+import entropy_video_coding as EVC
+import parser
 import main
 import platform_utils as pu
 
-# Inicialización multiplataforma
-TMP_DIR = pu.get_vcf_temp_dir()
-pu.ensure_description_file(__doc__)
-
-import parser
-import entropy_video_coding as EVC
-
+# Import MCTF components
 from motion_estimation import block_matching_bidirectional
 from motion_compensation import motion_compensate
 from temporal_filtering import temporal_filter_lifting, inverse_temporal_filter_lifting
 
-# Parámetros por defecto
+# Get temporary directory
+TMP_DIR = pu.get_vcf_temp_dir()
+
+# Default parameters
 DEFAULT_GOP_SIZE = 16
 DEFAULT_TEMPORAL_LEVELS = 4
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_SEARCH_RANGE = 16
 DEFAULT_WAVELET_TYPE = '5/3'
+DEFAULT_QSS = 128  # Quantization step size (higher than 2D-DCT due to simpler entropy coding)
 
-# Parser para encoder - usamos --video_input para evitar conflicto con -o de entropy_image_coding
+# Encoder parser
 parser.parser_encode.add_argument("-V", "--video_input", type=parser.int_or_str,
     help=f"Input video (default: {EVC.ENCODE_INPUT})",
     default=EVC.ENCODE_INPUT)
@@ -59,6 +54,7 @@ parser.parser_encode.add_argument("-T", "--transform", type=str,
 parser.parser_encode.add_argument("-N", "--number_of_frames", type=parser.int_or_str,
     help=f"Number of frames to encode (default: {EVC.N_FRAMES})",
     default=f"{EVC.N_FRAMES}")
+# Note: -q/--QSS is already defined in deadzone.py (imported via 2D-DCT chain)
 parser.parser_encode.add_argument("--gop_size", type=int,
     help=f"GOP size (default: {DEFAULT_GOP_SIZE})",
     default=DEFAULT_GOP_SIZE)
@@ -75,7 +71,7 @@ parser.parser_encode.add_argument("--wavelet_type", type=str,
     help=f"Temporal wavelet type: haar, 5/3, 9/7 (default: {DEFAULT_WAVELET_TYPE})",
     default=DEFAULT_WAVELET_TYPE)
 
-# Parser para decoder - usamos --video_input para evitar conflicto
+# Decoder parser
 parser.parser_decode.add_argument("-V", "--video_input", type=parser.int_or_str,
     help=f"Input MCTF stream prefix (default: {EVC.ENCODE_OUTPUT_PREFIX})",
     default=EVC.ENCODE_OUTPUT_PREFIX)
@@ -88,6 +84,7 @@ parser.parser_decode.add_argument("-T", "--transform", type=str,
 parser.parser_decode.add_argument("-N", "--number_of_frames", type=parser.int_or_str,
     help=f"Number of frames to decode (default: {EVC.N_FRAMES})",
     default=f"{EVC.N_FRAMES}")
+# Note: -q/--QSS is already defined in deadzone.py (imported via 2D-DCT chain)
 parser.parser_decode.add_argument("--gop_size", type=int,
     help=f"GOP size (default: {DEFAULT_GOP_SIZE})",
     default=DEFAULT_GOP_SIZE)
@@ -104,61 +101,53 @@ parser.parser_decode.add_argument("--wavelet_type", type=str,
     help=f"Temporal wavelet type: haar, 5/3, 9/7 (default: {DEFAULT_WAVELET_TYPE})",
     default=DEFAULT_WAVELET_TYPE)
 
+# Import transform module
+import importlib
 args = parser.parser.parse_known_args()[0]
-
-# Importar transformada espacial
-if __debug__:
-    if args.debug:
-        print(f"MCTF: Importing {args.transform}")
-
-try:
-    transform = importlib.import_module(args.transform)
-except ImportError as e:
-    print(f"Error: Could not find {args.transform} module ({e})")
-    sys.exit(1)
+transform = importlib.import_module(args.transform)
 
 
-class CoDec(EVC.CoDec):
+class CoDec(transform.CoDec):
     """
-    Codec MCTF (Motion Compensated Temporal Filtering).
-    
-    Implementa compresión de video usando:
-    1. Estimación de movimiento bidireccional
-    2. Filtrado temporal con lifting scheme (Predict + Update)
-    3. Transformada espacial 2D (DCT o DWT)
-    4. Cuantización y codificación entrópica
+    MCTF (Motion Compensated Temporal Filtering) Codec.
+
+    Implements temporal filtering with motion compensation using
+    the lifting scheme for video compression.
+
+    Pipeline:
+    1. Bidirectional motion estimation
+    2. Temporal filtering with lifting scheme (Predict + Update)
+    3. Quantization
+    4. Entropy coding (zlib compression)
     """
 
     def __init__(self, args):
         logging.debug("trace")
         super().__init__(args)
-        
-        # Configuración MCTF
+
+        # MCTF configuration
         self.gop_size = args.gop_size
         self.temporal_levels = args.temporal_levels
         self.block_size = args.block_size
         self.search_range = args.search_range
         self.wavelet_type = args.wavelet_type
-        
-        # Codec de transformada espacial
-        self.transform_codec = transform.CoDec(args)
-        
+        self.QSS = args.QSS
+
         logging.info(f"MCTF Codec initialized:")
         logging.info(f"  GOP size: {self.gop_size}")
         logging.info(f"  Temporal levels: {self.temporal_levels}")
         logging.info(f"  Block size: {self.block_size}")
         logging.info(f"  Search range: {self.search_range}")
         logging.info(f"  Wavelet type: {self.wavelet_type}")
-        logging.info(f"  Spatial transform: {args.transform}")
+        logging.info(f"  QSS: {self.QSS}")
 
     def bye(self):
-        """Sobrescribe bye() para usar video_input/video_output."""
+        """Override bye() to use video_input/video_output."""
         logging.debug("trace")
         if __debug__:
             if self.encoding:
-                BPP = (self.total_output_size*8)/(self.N_frames*self.width*self.height)
+                BPP = (self.total_output_size * 8) / (self.N_frames * self.width * self.height)
                 logging.info(f"Output bit-rate = {BPP} bits/pixel")
-                # Guardar metadatos
                 with open(f"{self.args.video_output}.txt", 'w') as f:
                     f.write(f"{self.args.video_input}\n")
                     f.write(f"{self.N_frames}\n")
@@ -166,7 +155,6 @@ class CoDec(EVC.CoDec):
                     f.write(f"{self.width}\n")
                     f.write(f"{BPP}\n")
             else:
-                # Leer metadatos y calcular distorsión
                 with open(f"{self.args.video_input}.txt", 'r') as f:
                     original_file = f.readline().strip()
                     logging.info(f"original_file = {original_file}")
@@ -179,51 +167,175 @@ class CoDec(EVC.CoDec):
                     BPP = float(f.readline().strip())
                     logging.info(f"BPP = {BPP}")
 
+    def quantize(self, data):
+        """Quantize data using QSS."""
+        return np.round(data / self.QSS).astype(np.int16)
+
+    def dequantize(self, data):
+        """Dequantize data using QSS."""
+        return (data * self.QSS).astype(np.float32)
+
+    def compress(self, data):
+        """Compress data using zlib."""
+        return zlib.compress(data.tobytes(), level=9)
+
+    def decompress(self, data, shape, dtype):
+        """Decompress data using zlib."""
+        decompressed = zlib.decompress(data)
+        return np.frombuffer(decompressed, dtype=dtype).reshape(shape)
+
+    def zigzag_scan_block(self, block):
+        """Apply zigzag scan to an 8x8 block (like JPEG)."""
+        zigzag_order = [
+            0,  1,  8, 16,  9,  2,  3, 10,
+           17, 24, 32, 25, 18, 11,  4,  5,
+           12, 19, 26, 33, 40, 48, 41, 34,
+           27, 20, 13,  6,  7, 14, 21, 28,
+           35, 42, 49, 56, 57, 50, 43, 36,
+           29, 22, 15, 23, 30, 37, 44, 51,
+           58, 59, 52, 45, 38, 31, 39, 46,
+           53, 60, 61, 54, 47, 55, 62, 63
+        ]
+        flat = block.flatten()
+        return np.array([flat[i] for i in zigzag_order])
+
+    def inverse_zigzag_block(self, zigzag_data):
+        """Inverse zigzag scan for an 8x8 block."""
+        zigzag_order = [
+            0,  1,  8, 16,  9,  2,  3, 10,
+           17, 24, 32, 25, 18, 11,  4,  5,
+           12, 19, 26, 33, 40, 48, 41, 34,
+           27, 20, 13,  6,  7, 14, 21, 28,
+           35, 42, 49, 56, 57, 50, 43, 36,
+           29, 22, 15, 23, 30, 37, 44, 51,
+           58, 59, 52, 45, 38, 31, 39, 46,
+           53, 60, 61, 54, 47, 55, 62, 63
+        ]
+        block = np.zeros(64, dtype=zigzag_data.dtype)
+        for i, idx in enumerate(zigzag_order):
+            block[idx] = zigzag_data[i]
+        return block.reshape(8, 8)
+
+    def zigzag_frame(self, frame, block_size=8):
+        """Apply zigzag scan to all blocks in a frame."""
+        h, w = frame.shape
+        result = []
+        for i in range(0, h, block_size):
+            for j in range(0, w, block_size):
+                block = frame[i:i+block_size, j:j+block_size]
+                if block.shape == (block_size, block_size):
+                    result.append(self.zigzag_scan_block(block))
+        return np.concatenate(result)
+
+    def inverse_zigzag_frame(self, zigzag_data, shape, block_size=8):
+        """Inverse zigzag scan for a frame."""
+        h, w = shape
+        frame = np.zeros((h, w), dtype=zigzag_data.dtype)
+        block_idx = 0
+        for i in range(0, h, block_size):
+            for j in range(0, w, block_size):
+                if i + block_size <= h and j + block_size <= w:
+                    block_data = zigzag_data[block_idx*64:(block_idx+1)*64]
+                    frame[i:i+block_size, j:j+block_size] = self.inverse_zigzag_block(block_data)
+                    block_idx += 1
+        return frame
+
+    def block_dct(self, frame, block_size=8):
+        """Apply DCT to frame in blocks (like JPEG)."""
+        h, w = frame.shape
+        pad_h = (block_size - h % block_size) % block_size
+        pad_w = (block_size - w % block_size) % block_size
+        if pad_h > 0 or pad_w > 0:
+            frame = np.pad(frame, ((0, pad_h), (0, pad_w)), mode='edge')
+
+        result = np.zeros_like(frame, dtype=np.float32)
+        for i in range(0, frame.shape[0], block_size):
+            for j in range(0, frame.shape[1], block_size):
+                block = frame[i:i+block_size, j:j+block_size].astype(np.float32)
+                result[i:i+block_size, j:j+block_size] = cv2.dct(block)
+
+        return result[:h, :w] if pad_h > 0 or pad_w > 0 else result
+
+    def block_idct(self, dct_frame, block_size=8):
+        """Apply inverse DCT to frame in blocks."""
+        h, w = dct_frame.shape
+        pad_h = (block_size - h % block_size) % block_size
+        pad_w = (block_size - w % block_size) % block_size
+        if pad_h > 0 or pad_w > 0:
+            dct_frame = np.pad(dct_frame, ((0, pad_h), (0, pad_w)), mode='constant')
+
+        result = np.zeros_like(dct_frame, dtype=np.float32)
+        for i in range(0, dct_frame.shape[0], block_size):
+            for j in range(0, dct_frame.shape[1], block_size):
+                block = dct_frame[i:i+block_size, j:j+block_size].astype(np.float32)
+                result[i:i+block_size, j:j+block_size] = cv2.idct(block)
+
+        return result[:h, :w] if pad_h > 0 or pad_w > 0 else result
+
     def encode(self):
         """
-        Codifica un video usando MCTF.
+        Encode a video using MCTF.
 
-        Proceso:
-        1. Lee frames del video de entrada
-        2. Agrupa frames en GOPs
-        3. Para cada GOP:
-           a. Estima movimiento bidireccional
-           b. Aplica filtrado temporal (lifting)
-           c. Codifica frames L y H con transformada espacial
+        Process:
+        1. Read frames from input video
+        2. Group frames into GOPs
+        3. For each GOP:
+           a. Estimate bidirectional motion
+           b. Apply temporal filtering (lifting)
+           c. Quantize and compress L and H frames
+        4. Write encoded stream
         """
         logging.debug("trace")
-        fn = self.args.video_input
-        logging.info(f"MCTF Encoding {fn}")
+        self.encoding = True
 
-        # Leer video y extraer frames
-        container = av.open(fn)
-        frames = []
-        img_counter = 0
+        # Read input video
+        input_path = self.args.video_input
+        logging.info(f"MCTF Encoding {input_path}")
 
-        for packet in container.demux():
-            if __debug__:
-                self.total_input_size += packet.size
-            for frame in packet.decode():
-                img = frame.to_image()
-                img_array = np.array(img.convert('L'))  # Grayscale para MCTF
-                frames.append(img_array)
+        # Read frames in color (RGB)
+        import av
+        container = av.open(input_path)
+        frames_rgb = []
+        N = int(self.args.number_of_frames)
 
-                # Guardar original para comparación
-                if __debug__:
-                    img_fn = os.path.join(TMP_DIR, f"original_{img_counter:04d}.png")
-                    img.save(img_fn)
-
-                img_counter += 1
-                if img_counter >= self.args.number_of_frames:
-                    break
-            if img_counter >= self.args.number_of_frames:
+        for frame in container.decode(video=0):
+            if len(frames_rgb) >= N:
                 break
+            img = frame.to_ndarray(format='rgb24')
+            frames_rgb.append(img)
 
-        self.N_frames = len(frames)
-        self.height, self.width = frames[0].shape
-        logging.info(f"Read {self.N_frames} frames of size {self.width}x{self.height}")
+            # Save original frame for comparison
+            orig_fn = os.path.join(TMP_DIR, f"original_{len(frames_rgb)-1:04d}.png")
+            Image.fromarray(img).save(orig_fn)
 
-        # Procesar GOPs
+        container.close()
+
+        self.N_frames = len(frames_rgb)
+        self.height, self.width = frames_rgb[0].shape[:2]
+        self.is_color = len(frames_rgb[0].shape) == 3
+        logging.info(f"Read {self.N_frames} frames of size {self.width}x{self.height} (color={self.is_color})")
+
+        # Convert RGB to YCbCr for processing
+        # Y channel gets full MCTF, Cb/Cr get simpler processing
+        frames_y = []
+        frames_cb = []
+        frames_cr = []
+
+        for img in frames_rgb:
+            # Convert RGB to YCbCr
+            img_ycbcr = cv2.cvtColor(img, cv2.COLOR_RGB2YCrCb)
+            frames_y.append(img_ycbcr[:, :, 0].astype(np.float32))   # Y
+            frames_cb.append(img_ycbcr[:, :, 2].astype(np.float32))  # Cb (note: OpenCV uses YCrCb order)
+            frames_cr.append(img_ycbcr[:, :, 1].astype(np.float32))  # Cr
+
+        # Store chrominance for later
+        self.frames_cb = frames_cb
+        self.frames_cr = frames_cr
+
+        # Use Y channel for MCTF processing
+        frames = frames_y
+
+        # Process GOPs
         gop_data_list = []
         frame_idx = 0
         gop_counter = 0
@@ -231,30 +343,47 @@ class CoDec(EVC.CoDec):
         while frame_idx < self.N_frames:
             gop_end = min(frame_idx + self.gop_size, self.N_frames)
             gop_frames = frames[frame_idx:gop_end]
+            gop_cb = self.frames_cb[frame_idx:gop_end]
+            gop_cr = self.frames_cr[frame_idx:gop_end]
 
             logging.info(f"Processing GOP {gop_counter}: frames {frame_idx}-{gop_end-1}")
 
-            # Codificar GOP
+            # Encode GOP (Y channel with full MCTF)
             gop_data = self._encode_gop(gop_frames, gop_counter)
+
+            # Encode chrominance channels (simpler: just quantize and compress)
+            compressed_cb = []
+            compressed_cr = []
+            for cb, cr in zip(gop_cb, gop_cr):
+                # Cb channel
+                cb_quantized = self.quantize(cb)
+                cb_compressed = self.compress(cb_quantized)
+                compressed_cb.append({'data': cb_compressed, 'shape': cb.shape})
+                # Cr channel
+                cr_quantized = self.quantize(cr)
+                cr_compressed = self.compress(cr_quantized)
+                compressed_cr.append({'data': cr_compressed, 'shape': cr.shape})
+
+            gop_data['compressed_cb'] = compressed_cb
+            gop_data['compressed_cr'] = compressed_cr
             gop_data_list.append(gop_data)
 
             frame_idx = gop_end
             gop_counter += 1
 
-        # Guardar stream codificado
+        # Write encoded stream (this is the ONLY output we count)
         self._write_mctf_stream(gop_data_list)
 
         logging.info(f"MCTF encoding complete: {gop_counter} GOPs")
 
     def _encode_gop(self, gop_frames, gop_idx):
-        """Codifica un GOP usando MCTF."""
+        """Encode a GOP using MCTF."""
         n_frames = len(gop_frames)
 
         if n_frames < 2:
-            # GOP muy pequeño: codificar como intra
             return self._encode_intra_only(gop_frames, gop_idx)
 
-        # === Paso 1: Estimación de movimiento ===
+        # === Step 1: Motion estimation ===
         logging.info(f"  Motion estimation for {n_frames} frames")
         mv_forward_list = []
         mv_backward_list = []
@@ -271,78 +400,92 @@ class CoDec(EVC.CoDec):
             mv_forward_list.append(mv_fwd)
             mv_backward_list.append(mv_bwd)
 
-        # === Paso 2: Filtrado temporal (lifting) ===
+        # === Step 2: Temporal filtering ===
         logging.info(f"  Temporal filtering with {self.wavelet_type} wavelet")
-        low_pass, high_pass = temporal_filter_lifting(
+        low_pass, high_pass, predictions = temporal_filter_lifting(
             gop_frames,
             mv_forward_list,
             mv_backward_list,
             self.wavelet_type,
-            self.block_size
+            self.block_size,
+            return_predictions=True
         )
 
-        # === Paso 3: Codificar frames L y H con transformada espacial ===
-        logging.info(f"  Encoding {len(low_pass)} L frames and {len(high_pass)} H frames")
+        # Save prediction images to disk
+        for i, pred in enumerate(predictions):
+            pred_uint8 = np.clip(pred, 0, 255).astype(np.uint8)
+            pred_fn = os.path.join(TMP_DIR, f"prediction_{gop_idx:02d}_{i:04d}.png")
+            Image.fromarray(pred_uint8).save(pred_fn)
+        logging.info(f"  Saved {len(predictions)} prediction images")
 
-        encoded_low = []
+        # === Step 3: Apply spatial transform, quantize and compress L and H frames ===
+        logging.info(f"  Quantizing and compressing {len(low_pass)} L frames and {len(high_pass)} H frames")
+
+        compressed_low = []
         for i, l_frame in enumerate(low_pass):
-            l_frame_uint8 = np.clip(l_frame, 0, 255).astype(np.uint8)
-            fn_l = os.path.join(TMP_DIR, f"gop{gop_idx:02d}_L_{i:02d}")
-            self._save_and_encode_frame(l_frame_uint8, fn_l)
-            encoded_low.append(fn_l)
+            # Apply block DCT (8x8 blocks like JPEG)
+            l_dct = self.block_dct(l_frame)
+            # Quantize DCT coefficients
+            l_quantized = self.quantize(l_dct)
+            # Apply zigzag scan (groups zeros together for better compression)
+            l_zigzag = self.zigzag_frame(l_quantized)
+            # Compress
+            l_compressed = self.compress(l_zigzag)
+            compressed_low.append({
+                'data': l_compressed,
+                'shape': l_frame.shape
+            })
 
-        encoded_high = []
+        compressed_high = []
         for i, h_frame in enumerate(high_pass):
-            # Residuos pueden ser negativos: offset a positivo
-            h_frame_offset = h_frame + 128
-            h_frame_uint8 = np.clip(h_frame_offset, 0, 255).astype(np.uint8)
-            fn_h = os.path.join(TMP_DIR, f"gop{gop_idx:02d}_H_{i:02d}")
-            self._save_and_encode_frame(h_frame_uint8, fn_h)
-            encoded_high.append(fn_h)
+            # Apply block DCT (8x8 blocks like JPEG)
+            h_dct = self.block_dct(h_frame)
+            # Quantize DCT coefficients
+            h_quantized = self.quantize(h_dct)
+            # Apply zigzag scan (groups zeros together for better compression)
+            h_zigzag = self.zigzag_frame(h_quantized)
+            # Compress
+            h_compressed = self.compress(h_zigzag)
+            compressed_high.append({
+                'data': h_compressed,
+                'shape': h_frame.shape
+            })
+
+        # Compress motion vectors
+        mv_fwd_compressed = self.compress(np.array(mv_forward_list))
+        mv_bwd_compressed = self.compress(np.array(mv_backward_list))
 
         return {
             'n_frames': n_frames,
-            'mv_forward': mv_forward_list,
-            'mv_backward': mv_backward_list,
-            'encoded_low': encoded_low,
-            'encoded_high': encoded_high,
+            'mv_forward': mv_fwd_compressed,
+            'mv_forward_shape': np.array(mv_forward_list).shape,
+            'mv_backward': mv_bwd_compressed,
+            'mv_backward_shape': np.array(mv_backward_list).shape,
+            'compressed_low': compressed_low,
+            'compressed_high': compressed_high,
             'wavelet_type': self.wavelet_type
         }
 
     def _encode_intra_only(self, frames, gop_idx):
-        """Codifica frames como intra solamente."""
-        encoded_frames = []
-        for i, frame in enumerate(frames):
-            fn = os.path.join(TMP_DIR, f"gop{gop_idx:02d}_I_{i:02d}")
-            self._save_and_encode_frame(frame, fn)
-            encoded_frames.append(fn)
+        """Encode frames as intra only."""
+        compressed_frames = []
+        for frame in frames:
+            f_quantized = self.quantize(frame.astype(np.float32))
+            f_compressed = self.compress(f_quantized)
+            compressed_frames.append({
+                'data': f_compressed,
+                'shape': frame.shape
+            })
 
         return {
             'n_frames': len(frames),
             'intra_only': True,
-            'encoded_frames': encoded_frames
+            'compressed_frames': compressed_frames
         }
 
-    def _save_and_encode_frame(self, frame, fn_prefix):
-        """Guarda y codifica un frame usando TIFF con compresión lossless."""
-        # Convertir a RGB si es grayscale
-        if len(frame.shape) == 2:
-            frame_rgb = np.stack([frame] * 3, axis=-1)
-        else:
-            frame_rgb = frame
-
-        # Guardar como TIFF con compresión lossless
-        img_fn = f"{fn_prefix}.tif"
-        img = Image.fromarray(frame_rgb)
-        img.save(img_fn, compression='tiff_deflate')
-
-        output_size = os.path.getsize(img_fn)
-        self.total_output_size += output_size
-        return output_size
-
     def _write_mctf_stream(self, gop_data_list):
-        """Escribe el stream MCTF codificado."""
-        stream_fn = f"{self.args.video_output}.mctf"
+        """Write the encoded MCTF stream."""
+        stream_fn = os.path.join(TMP_DIR, "encoded.mctf")
 
         header = {
             'n_frames': self.N_frames,
@@ -352,6 +495,7 @@ class CoDec(EVC.CoDec):
             'temporal_levels': self.temporal_levels,
             'block_size': self.block_size,
             'wavelet_type': self.wavelet_type,
+            'QSS': self.QSS,
             'num_gops': len(gop_data_list)
         }
 
@@ -361,63 +505,92 @@ class CoDec(EVC.CoDec):
                 pickle.dump(gop_data, f)
 
         stream_size = os.path.getsize(stream_fn)
-        self.total_output_size += stream_size
+        self.total_output_size = stream_size
         logging.info(f"Written MCTF stream: {stream_fn} ({stream_size} bytes)")
 
     def decode(self):
         """
-        Decodifica un video codificado con MCTF.
+        Decode a video using MCTF.
 
-        Proceso inverso:
-        1. Lee stream MCTF
-        2. Para cada GOP:
-           a. Decodifica frames L y H con transformada espacial inversa
-           b. Aplica filtrado temporal inverso (lifting inverso)
-        3. Escribe frames decodificados
+        Process:
+        1. Read encoded stream
+        2. For each GOP:
+           a. Decompress and dequantize L and H frames
+           b. Apply inverse temporal filtering
+           c. Reconstruct frames
+        3. Write decoded frames
         """
         logging.debug("trace")
+        self.encoding = False
+
+        stream_fn = os.path.join(TMP_DIR, "encoded.mctf")
         logging.info(f"MCTF Decoding {self.args.video_input}")
 
-        # Leer stream MCTF
-        stream_fn = f"{self.args.video_input}.mctf"
+        # Read encoded stream
         header, gop_data_list = self._read_mctf_stream(stream_fn)
 
         self.N_frames = header['n_frames']
         self.height = header['height']
         self.width = header['width']
+        self.QSS = header.get('QSS', DEFAULT_QSS)
 
         logging.info(f"Decoding {self.N_frames} frames of size {self.width}x{self.height}")
-        logging.info(f"  {header['num_gops']} GOPs")
+        logging.info(f"  {header['num_gops']} GOPs, QSS={self.QSS}")
 
-        # Decodificar cada GOP
-        all_frames = []
+        # Decode each GOP
+        all_frames_y = []
+        all_frames_cb = []
+        all_frames_cr = []
+
         for gop_idx, gop_data in enumerate(gop_data_list):
             logging.info(f"Decoding GOP {gop_idx}")
 
             if gop_data.get('intra_only', False):
-                gop_frames = self._decode_intra_only(gop_data)
+                gop_frames_y = self._decode_intra_only(gop_data)
             else:
-                gop_frames = self._decode_gop(gop_data)
+                gop_frames_y = self._decode_gop(gop_data)
 
-            all_frames.extend(gop_frames)
+            all_frames_y.extend(gop_frames_y)
 
-        # Escribir frames decodificados
-        for i, frame in enumerate(all_frames):
-            frame_uint8 = np.clip(frame, 0, 255).astype(np.uint8)
-            out_fn = os.path.join(TMP_DIR, f"decoded_{i:04d}.png")
+            # Decode chrominance channels
+            if 'compressed_cb' in gop_data:
+                for cb_item, cr_item in zip(gop_data['compressed_cb'], gop_data['compressed_cr']):
+                    cb_quantized = self.decompress(cb_item['data'], cb_item['shape'], np.int16)
+                    cb_frame = self.dequantize(cb_quantized)
+                    all_frames_cb.append(cb_frame)
 
-            if len(frame_uint8.shape) == 2:
-                frame_rgb = np.stack([frame_uint8] * 3, axis=-1)
+                    cr_quantized = self.decompress(cr_item['data'], cr_item['shape'], np.int16)
+                    cr_frame = self.dequantize(cr_quantized)
+                    all_frames_cr.append(cr_frame)
+
+        # Write decoded frames (in color if chrominance available)
+        is_color = len(all_frames_cb) > 0
+
+        for i, frame_y in enumerate(all_frames_y):
+            if is_color and i < len(all_frames_cb):
+                # Reconstruct color frame
+                y = np.clip(frame_y, 0, 255).astype(np.uint8)
+                cb = np.clip(all_frames_cb[i], 0, 255).astype(np.uint8)
+                cr = np.clip(all_frames_cr[i], 0, 255).astype(np.uint8)
+
+                # Combine YCrCb (OpenCV order)
+                ycrcb = np.stack([y, cr, cb], axis=-1)
+                rgb = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2RGB)
+
+                out_fn = os.path.join(TMP_DIR, f"decoded_{i:04d}.png")
+                Image.fromarray(rgb).save(out_fn)
             else:
-                frame_rgb = frame_uint8
+                # Grayscale
+                frame_uint8 = np.clip(frame_y, 0, 255).astype(np.uint8)
+                out_fn = os.path.join(TMP_DIR, f"decoded_{i:04d}.png")
+                Image.fromarray(frame_uint8).save(out_fn)
 
-            Image.fromarray(frame_rgb).save(out_fn)
             logging.info(f"Decoded frame {i} to {out_fn}")
 
-        logging.info(f"MCTF decoding complete: {len(all_frames)} frames")
+        logging.info(f"MCTF decoding complete: {len(all_frames_y)} frames (color={is_color})")
 
     def _read_mctf_stream(self, stream_fn):
-        """Lee el stream MCTF codificado."""
+        """Read the encoded MCTF stream."""
         with open(stream_fn, 'rb') as f:
             header = pickle.load(f)
             gop_data_list = []
@@ -428,28 +601,48 @@ class CoDec(EVC.CoDec):
         return header, gop_data_list
 
     def _decode_gop(self, gop_data):
-        """Decodifica un GOP usando MCTF inverso."""
+        """Decode a GOP using inverse MCTF."""
         n_frames = gop_data['n_frames']
-        mv_forward = gop_data['mv_forward']
-        mv_backward = gop_data['mv_backward']
         wavelet_type = gop_data['wavelet_type']
 
-        # === Paso 1: Decodificar frames L y H ===
-        logging.info(f"  Decoding L and H frames")
+        # === Step 1: Decompress, dequantize and apply inverse DCT to L and H frames ===
+        logging.info(f"  Decompressing L and H frames")
 
         low_pass = []
-        for fn_l in gop_data['encoded_low']:
-            frame = self._decode_frame(fn_l)
-            low_pass.append(frame.astype(np.float32))
+        for item in gop_data['compressed_low']:
+            shape = item['shape']
+            n_blocks = (shape[0] // 8) * (shape[1] // 8)
+            zigzag_shape = (n_blocks * 64,)
+            l_zigzag = self.decompress(item['data'], zigzag_shape, np.int16)
+            l_quantized = self.inverse_zigzag_frame(l_zigzag, shape)
+            l_dct = self.dequantize(l_quantized)
+            l_frame = self.block_idct(l_dct)
+            low_pass.append(l_frame)
 
         high_pass = []
-        for fn_h in gop_data['encoded_high']:
-            frame = self._decode_frame(fn_h)
-            # Remover offset añadido en codificación
-            frame_float = frame.astype(np.float32) - 128
-            high_pass.append(frame_float)
+        for item in gop_data['compressed_high']:
+            shape = item['shape']
+            n_blocks = (shape[0] // 8) * (shape[1] // 8)
+            zigzag_shape = (n_blocks * 64,)
+            h_zigzag = self.decompress(item['data'], zigzag_shape, np.int16)
+            h_quantized = self.inverse_zigzag_frame(h_zigzag, shape)
+            h_dct = self.dequantize(h_quantized)
+            h_frame = self.block_idct(h_dct)
+            high_pass.append(h_frame)
 
-        # === Paso 2: Filtrado temporal inverso ===
+        # Decompress motion vectors
+        mv_forward = self.decompress(
+            gop_data['mv_forward'],
+            gop_data['mv_forward_shape'],
+            np.float32
+        )
+        mv_backward = self.decompress(
+            gop_data['mv_backward'],
+            gop_data['mv_backward_shape'],
+            np.float32
+        )
+
+        # === Step 2: Inverse temporal filtering ===
         logging.info(f"  Inverse temporal filtering with {wavelet_type} wavelet")
         reconstructed = inverse_temporal_filter_lifting(
             low_pass,
@@ -463,23 +656,14 @@ class CoDec(EVC.CoDec):
         return reconstructed
 
     def _decode_intra_only(self, gop_data):
-        """Decodifica frames intra solamente."""
+        """Decode intra-only frames."""
         frames = []
-        for fn in gop_data['encoded_frames']:
-            frame = self._decode_frame(fn)
-            frames.append(frame.astype(np.float32))
+        for item in gop_data['compressed_frames']:
+            f_quantized = self.decompress(item['data'], item['shape'], np.int16)
+            frame = self.dequantize(f_quantized)
+            frames.append(frame)
         return frames
-
-    def _decode_frame(self, fn_prefix):
-        """Decodifica un frame leyendo el TIFF."""
-        img_fn = f"{fn_prefix}.tif"
-
-        # Leer frame desde TIFF
-        img = Image.open(img_fn)
-        frame = np.array(img.convert('L'))  # Grayscale
-        return frame
 
 
 if __name__ == "__main__":
     main.main(parser.parser, logging, CoDec)
-
