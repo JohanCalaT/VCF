@@ -106,6 +106,13 @@ import importlib
 args = parser.parser.parse_known_args()[0]
 transform = importlib.import_module(args.transform)
 
+# Import denoiser module (for filters like gaussian_blur)
+try:
+    denoiser = importlib.import_module(args.filter)
+except:
+    # Remember that the filter is only active when decoding.
+    denoiser = importlib.import_module("no_filter")
+
 
 class CoDec(transform.CoDec):
     """
@@ -577,11 +584,18 @@ class CoDec(transform.CoDec):
                 ycrcb = np.stack([y, cr, cb], axis=-1)
                 rgb = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2RGB)
 
+                # Apply denoising filter (e.g., gaussian_blur)
+                rgb = denoiser.CoDec.filter(self, rgb)
+
                 out_fn = os.path.join(TMP_DIR, f"decoded_{i:04d}.png")
                 Image.fromarray(rgb).save(out_fn)
             else:
                 # Grayscale
                 frame_uint8 = np.clip(frame_y, 0, 255).astype(np.uint8)
+
+                # Apply denoising filter (e.g., gaussian_blur)
+                frame_uint8 = denoiser.CoDec.filter(self, frame_uint8)
+
                 out_fn = os.path.join(TMP_DIR, f"decoded_{i:04d}.png")
                 Image.fromarray(frame_uint8).save(out_fn)
 
